@@ -1,0 +1,629 @@
+from pathlib import Path
+import joblib
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import json
+import time
+import tomllib
+import urllib.parse
+import urllib.request
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "models" / "cardiosense_rr_model.joblib"
+
+st.set_page_config(page_title="CardioSense AI", page_icon="🫀", layout="wide")
+
+PURPLE = "#8B5CF6"
+PURPLE_SOFT = "#A78BFA"
+LIME = "#B6FF3B"
+MAGENTA = "#FF3EA5"
+MUTED = "#9CA3AF"
+
+CLASS_COLORS = {"N": LIME, "S": PURPLE_SOFT, "V": MAGENTA}
+CLASS_NAMES = {
+    "N": "Normal beat",
+    "S": "Supraventricular ectopic beat",
+    "V": "Ventricular ectopic beat",
+}
+TRAIN_COUNTS = {"N": 38976, "S": 181, "V": 2516}
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@500;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -0.5px; }
+
+.stApp {
+    background:
+        radial-gradient(900px 500px at 85% -10%, rgba(139,92,246,0.22), transparent 60%),
+        radial-gradient(700px 400px at -10% 110%, rgba(182,255,59,0.08), transparent 60%),
+        #050507;
+}
+#MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; }
+.block-container { padding-top: 2rem; max-width: 1250px; }
+
+section[data-testid="stSidebar"] {
+    background: #08080c;
+    border-right: 1px solid rgba(139,92,246,0.25);
+}
+
+.brand { font-family:'Space Grotesk'; font-weight:700; font-size:1.5rem; color:#F5F5F7; }
+.brand span { color:#B6FF3B; }
+.pulse { display:inline-block; width:9px; height:9px; border-radius:50%;
+         background:#B6FF3B; margin-right:8px; box-shadow:0 0 0 0 rgba(182,255,59,.7);
+         animation:pulse 1.6s infinite; }
+@keyframes pulse { 70% { box-shadow:0 0 0 10px rgba(182,255,59,0);} 100% { box-shadow:0 0 0 0 rgba(182,255,59,0);} }
+
+.chip { display:inline-block; padding:3px 12px; border-radius:999px; font-size:.75rem;
+        border:1px solid rgba(182,255,59,.5); color:#B6FF3B; background:rgba(182,255,59,.08);
+        font-family:'JetBrains Mono'; }
+.chip.purple { border-color:rgba(167,139,250,.6); color:#A78BFA; background:rgba(139,92,246,.1); }
+
+.hero-title { font-family:'Space Grotesk'; font-weight:700; font-size:3.2rem; line-height:1.05;
+    background:linear-gradient(90deg,#A78BFA 0%,#8B5CF6 40%,#B6FF3B 100%);
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin:0.2rem 0 0.4rem 0; }
+.hero-sub { color:#9CA3AF; font-size:1.05rem; max-width:720px; }
+
+.ecg-wrap { margin:14px 0 6px 0; opacity:.95; }
+.ecg-line { stroke:#B6FF3B; stroke-width:2.2; fill:none; stroke-linecap:round; stroke-linejoin:round;
+    stroke-dasharray:900; stroke-dashoffset:900; animation:draw 3.2s linear infinite;
+    filter:drop-shadow(0 0 5px rgba(182,255,59,.8)); }
+@keyframes draw { 0% { stroke-dashoffset:900; } 70% { stroke-dashoffset:0; } 100% { stroke-dashoffset:-900; } }
+
+.card { background:rgba(255,255,255,0.03); border:1px solid rgba(139,92,246,0.35);
+    border-radius:16px; padding:18px 20px; transition:all .25s ease; height:100%; }
+.card:hover { border-color:#8B5CF6; box-shadow:0 0 28px rgba(139,92,246,.25); transform:translateY(-2px); }
+.kpi-label { color:#9CA3AF; font-size:.78rem; text-transform:uppercase; letter-spacing:1.5px; }
+.kpi-value { font-family:'JetBrains Mono'; font-weight:700; font-size:2rem; color:#B6FF3B; margin-top:4px; }
+.kpi-small { font-size:1.25rem; }
+
+.class-badge { font-family:'JetBrains Mono'; font-weight:700; font-size:2rem; width:56px; height:56px;
+    display:flex; align-items:center; justify-content:center; border-radius:14px; }
+
+.result-card { border-radius:20px; padding:28px; text-align:center;
+    background:rgba(255,255,255,0.03); border:1px solid rgba(139,92,246,.45); }
+.result-letter { font-family:'JetBrains Mono'; font-weight:700; font-size:5rem; line-height:1; }
+.result-name { font-family:'Space Grotesk'; font-size:1.3rem; color:#F5F5F7; margin-top:6px; }
+
+.disclaimer { border:1px dashed rgba(255,62,165,.55); background:rgba(255,62,165,.06);
+    color:#F5F5F7; padding:10px 16px; border-radius:12px; font-size:.88rem; margin-top:18px; }
+.note { color:#9CA3AF; font-size:.85rem; }
+
+div.stButton > button, div.stDownloadButton > button {
+    background:linear-gradient(90deg,#7C3AED,#8B5CF6); color:#fff; border:0; border-radius:12px;
+    padding:.6rem 1.4rem; font-weight:600; font-family:'Space Grotesk'; transition:all .2s ease; }
+div.stButton > button:hover, div.stDownloadButton > button:hover {
+    box-shadow:0 0 22px rgba(139,92,246,.7); color:#B6FF3B; }
+
+[data-testid="stFileUploader"] section { background:rgba(255,255,255,0.03);
+    border:1px dashed rgba(139,92,246,.6); border-radius:14px; }
+[data-testid="stDataFrame"] { border:1px solid rgba(139,92,246,.3); border-radius:12px; }
+button[data-baseweb="tab"] { font-family:'Space Grotesk'; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+
+def to_label(c):
+    s = str(c)
+    if s in ("N", "S", "V"):
+        return s
+    return {"0": "N", "1": "S", "2": "V"}.get(s, s)
+
+
+def predict_rr(model, rr_values):
+    rr = np.asarray(rr_values, dtype=float)
+    if hasattr(model, "feature_names_in_"):
+        X = pd.DataFrame({model.feature_names_in_[0]: rr})
+    else:
+        X = rr.reshape(-1, 1)
+
+    preds = [to_label(p) for p in model.predict(X)]
+    probs = model.predict_proba(X)
+    labels = [to_label(c) for c in model.classes_]
+    return preds, probs, labels
+
+
+def send_caregiver_alert(prediction, rr_seconds, probabilities, labels):
+    secrets_file = BASE_DIR / ".streamlit" / "secrets.toml"
+
+    if not secrets_file.exists():
+        return False, "Telegram settings file not found."
+
+    try:
+        with open(secrets_file, "rb") as file:
+            settings = tomllib.load(file)
+
+        token = settings["TELEGRAM_BOT_TOKEN"]
+        chat_id = settings["TELEGRAM_CHAT_ID"]
+
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return False, "Telegram settings are incomplete or invalid."
+
+    probability_text = "\n".join(
+        f"{label}: {probability * 100:.1f}%"
+        for label, probability in zip(labels, probabilities)
+    )
+
+    class_description = CLASS_NAMES.get(prediction, prediction)
+
+    message = (
+        "CARDIOSENSE AI — EXPERIMENTAL SCREENING NOTIFICATION\n\n"
+        f"The prototype model flagged: {prediction} ({class_description})\n"
+        f"Previous RR interval: {rr_seconds:.2f} seconds\n"
+        f"Approximate heart-rate equivalent: {60 / rr_seconds:.0f} bpm\n\n"
+        f"Model probability output:\n{probability_text}\n\n"
+        "This is an experimental software prediction, NOT a diagnosis or confirmed emergency. "
+        "Please check on the person and follow appropriate medical guidance if they feel unwell."
+    )
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message
+    }).encode("utf-8")
+
+    request = urllib.request.Request(url, data=payload)
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        if result.get("ok"):
+            return True, "Telegram notification delivered to the caregiver."
+
+        return False, "Telegram did not accept the notification."
+
+    except Exception as error:
+        return False, f"Telegram delivery failed ({type(error).__name__})."
+
+
+def maybe_send_caregiver_alert(prediction, rr_seconds, probabilities, labels):
+    if prediction == "N":
+        return None
+
+    now = time.time()
+    last_sent = st.session_state.get("caregiver_alert_last_sent", {})
+    previous = last_sent.get(prediction, 0)
+    cooldown_seconds = 300
+
+    if now - previous < cooldown_seconds:
+        remaining = int(cooldown_seconds - (now - previous))
+        return (
+            "cooldown",
+            f"A {prediction}-class notification was already sent recently. "
+            f"Cooldown: {remaining // 60}m {remaining % 60}s remaining."
+        )
+
+    success, message = send_caregiver_alert(
+        prediction, rr_seconds, probabilities, labels
+    )
+
+    if success:
+        last_sent[prediction] = now
+        st.session_state["caregiver_alert_last_sent"] = last_sent
+        return ("success", message)
+
+    return ("error", message)
+
+
+def kpi(label, value, small=False):
+    cls = "kpi-value kpi-small" if small else "kpi-value"
+    return (
+        f'<div class="card"><div class="kpi-label">{label}</div>'
+        f'<div class="{cls}">{value}</div></div>'
+    )
+
+
+def class_card(letter, desc):
+    color = CLASS_COLORS[letter]
+    return (
+        f'<div class="card" style="display:flex; gap:16px; align-items:center;">'
+        f'<div class="class-badge" style="color:{color}; border:1px solid {color}; '
+        f'background:{color}1A;">{letter}</div>'
+        f'<div><div style="font-family:Space Grotesk; font-weight:700; color:#F5F5F7;">'
+        f'{CLASS_NAMES[letter]}</div><div class="note">{desc}</div></div></div>'
+    )
+
+
+def style_fig(fig, height=340):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="JetBrains Mono, monospace", color="#E5E7EB"),
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=height,
+        legend=dict(bgcolor="rgba(0,0,0,0)"),
+    )
+    fig.update_xaxes(
+        gridcolor="rgba(139,92,246,0.15)",
+        zerolinecolor="rgba(139,92,246,0.25)"
+    )
+    fig.update_yaxes(
+        gridcolor="rgba(139,92,246,0.15)",
+        zerolinecolor="rgba(139,92,246,0.25)"
+    )
+    return fig
+
+
+def distribution_chart(counts, title, log=False):
+    letters = ["N", "S", "V"]
+    fig = go.Figure(
+        go.Bar(
+            x=letters,
+            y=[counts.get(k, 0) for k in letters],
+            marker=dict(color=[CLASS_COLORS[k] for k in letters]),
+            text=[f"{counts.get(k, 0):,}" for k in letters],
+            textposition="outside",
+        )
+    )
+    fig.update_layout(title=title)
+    if log:
+        fig.update_yaxes(type="log")
+    return style_fig(fig)
+
+
+def prob_chart(probs, labels):
+    fig = go.Figure(
+        go.Bar(
+            y=labels,
+            x=[p * 100 for p in probs],
+            orientation="h",
+            marker=dict(color=[CLASS_COLORS.get(l, PURPLE) for l in labels]),
+            text=[f"{p*100:.1f}%" for p in probs],
+            textposition="outside",
+        )
+    )
+    fig.update_layout(title="Model probability by class")
+    fig.update_xaxes(range=[0, 115], title="%")
+    return style_fig(fig, height=260)
+
+
+def illustrative_ecg():
+    t = np.linspace(0, 3, 1500)
+    y = np.zeros_like(t)
+
+    for c in (0.4, 1.4, 2.4):
+        y += 0.12 * np.exp(-((t - (c - 0.18)) ** 2) / 0.0025)
+        y -= 0.15 * np.exp(-((t - (c - 0.04)) ** 2) / 0.00015)
+        y += 1.0 * np.exp(-((t - c) ** 2) / 0.00012)
+        y -= 0.22 * np.exp(-((t - (c + 0.04)) ** 2) / 0.00015)
+        y += 0.28 * np.exp(-((t - (c + 0.28)) ** 2) / 0.004)
+
+    fig = go.Figure(
+        go.Scatter(x=t, y=y, mode="lines", line=dict(color=LIME, width=2.5))
+    )
+    fig.update_layout(title="Illustrative ECG waveform (not a real recording)")
+    fig.update_xaxes(title="time (s)")
+    fig.update_yaxes(title="amplitude (a.u.)")
+    return style_fig(fig, height=300)
+
+
+ECG_SVG = """
+<div class="ecg-wrap">
+<svg viewBox="0 0 900 80" width="100%" height="70" preserveAspectRatio="none">
+<path class="ecg-line" d="M0 40 L120 40 L140 40 L150 28 L160 40 L200 40 L215 46 L230 4 L245 70 L260 40 L300
+40 L330 30 L360 40 L520 40 L540 40 L550 28 L560 40 L600 40 L615 46 L630 4 L645 70 L660 40 L700 40 L730 30 L760
+40 L900 40"/>
+</svg></div>
+"""
+
+DISCLAIMER = (
+    '<div class="disclaimer"><b>Educational research prototype.</b> '
+    "Not a medical diagnostic device. Do not use for clinical decisions.</div>"
+)
+
+if not MODEL_PATH.exists():
+    st.error(f"Model file not found at: {MODEL_PATH}")
+    st.info("Check that the 'models' folder is next to the 'app.py' folder.")
+    st.stop()
+
+model = load_model()
+
+with st.sidebar:
+    st.markdown(
+        '<div class="brand"><span class="pulse"></span>Cardio<span>Sense</span> AI</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<div class="note" style="margin:4px 0 14px 0;">ECG heartbeat screening prototype</div>',
+        unsafe_allow_html=True
+    )
+    page = st.radio(
+        "Navigation",
+        ["Dashboard", "Single Prediction", "Batch Analysis", "About the Model"],
+        label_visibility="collapsed",
+    )
+    st.markdown('<br><span class="chip">● MODEL LOADED</span>', unsafe_allow_html=True)
+    st.markdown('<br><span class="chip purple">RR-ONLY · RANDOM FOREST</span>',
+                unsafe_allow_html=True)
+
+# ------------------------------------------------------------------
+# PAGE: DASHBOARD
+# ------------------------------------------------------------------
+if page == "Dashboard":
+    st.markdown('<span class="chip purple">RESEARCH PROTOTYPE</span>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-title">CardioSense AI</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="hero-sub">Machine-learning screening of heartbeat categories from the '
+        "previous RR interval, trained on the MIT-BIH Arrhythmia Database.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(ECG_SVG, unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(kpi("Training samples", "41,673"), unsafe_allow_html=True)
+    c2.markdown(kpi("Classes", "3"), unsafe_allow_html=True)
+    c3.markdown(kpi("Algorithm", "Random Forest", small=True), unsafe_allow_html=True)
+    c4.markdown(kpi("Input features", "1"), unsafe_allow_html=True)
+
+    st.markdown("### Heartbeat categories")
+    k1, k2, k3 = st.columns(3)
+    k1.markdown(class_card("N", "Regular conduction, normal rhythm."), unsafe_allow_html=True)
+    k2.markdown(class_card("S", "Early beat from above the ventricles."), unsafe_allow_html=True)
+    k3.markdown(class_card("V", "Early beat from the ventricles."), unsafe_allow_html=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            distribution_chart(TRAIN_COUNTS, "Training class distribution (log scale)", log=True),
+            width="stretch"
+        )
+        st.markdown(
+            '<div class="note">Highly imbalanced: only 181 S-class beats vs 38,976 N.</div>',
+            unsafe_allow_html=True
+        )
+    with right:
+        st.plotly_chart(illustrative_ecg(), width="stretch")
+        st.markdown(
+            '<span class="chip">ILLUSTRATIVE</span> '
+            '<span class="note">Not a real ECG and not processed by the model.</span>',
+            unsafe_allow_html=True
+        )
+    st.markdown(DISCLAIMER, unsafe_allow_html=True)
+
+# ------------------------------------------------------------------
+# PAGE: SINGLE PREDICTION
+# ------------------------------------------------------------------
+elif page == "Single Prediction":
+    st.markdown("## Single Prediction")
+    st.markdown(
+        '<div class="note">Enter the previous RR interval (time since the last heartbeat).</div>',
+        unsafe_allow_html=True
+    )
+
+    rr = st.number_input(
+        "Previous RR interval (seconds)",
+        min_value=0.05,
+        max_value=5.0,
+        value=0.80,
+        step=0.01,
+        format="%.2f"
+    )
+    go_btn = st.button("Run classification")
+
+    if rr < 0.2 or rr > 2.5:
+        st.warning("This RR value is outside the typical range (0.2 to 2.5 s). Result may be unreliable.")
+
+    if go_btn:
+        preds, probs, labels = predict_rr(model, [rr])
+        pred = preds[0]
+        color = CLASS_COLORS.get(pred, PURPLE)
+
+        a, b = st.columns([1, 1.3])
+        with a:
+            st.markdown(
+                f'<div class="result-card"><div class="kpi-label">Predicted class</div>'
+                f'<div class="result-letter" style="color:{color}; text-shadow:0 0 30px {color}88;">{pred}</div>'
+                f'<div class="result-name">{CLASS_NAMES.get(pred, pred)}</div></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                kpi("Heart-rate equivalent", f"{60 / rr:.0f} bpm", small=True),
+                unsafe_allow_html=True
+            )
+
+        with b:
+            st.plotly_chart(prob_chart(probs[0], labels), width="stretch")
+            st.markdown(
+                '<div class="note">This is the model\'s probability output, not clinical confidence.</div>',
+                unsafe_allow_html=True
+            )
+
+        if pred in ("S", "V"):
+            alert_result = maybe_send_caregiver_alert(pred, rr, probs[0], labels)
+            if alert_result:
+                status, alert_message = alert_result
+                if status == "success":
+                    st.success(alert_message)
+                elif status == "cooldown":
+                    st.info(alert_message)
+                else:
+                    st.warning(alert_message)
+        else:
+            st.info("No caregiver notification sent: the model classified this input as N (normal).")
+
+    st.markdown(DISCLAIMER, unsafe_allow_html=True)
+
+# ------------------------------------------------------------------
+# PAGE: BATCH ANALYSIS
+# ------------------------------------------------------------------
+elif page == "Batch Analysis":
+    st.markdown("## Batch Analysis")
+    st.markdown(
+        '<div class="note">Upload a CSV with one column named <code>rr_previous</code> (seconds).</div>',
+        unsafe_allow_html=True
+    )
+
+    sample = pd.DataFrame({"rr_previous": [0.80, 0.65, 1.10, 0.90, 0.75]})
+    st.download_button(
+        "Download sample CSV",
+        sample.to_csv(index=False).encode("utf-8"),
+        file_name="sample_rr.csv",
+        mime="text/csv"
+    )
+
+    up = st.file_uploader("Upload CSV", type=["csv"])
+
+    if up is not None:
+        try:
+            df = pd.read_csv(up)
+        except Exception as e:
+            st.error(f"Could not read this file: {e}")
+            st.stop()
+
+        if "rr_previous" not in df.columns:
+            st.error("Column 'rr_previous' not found. Please check your CSV header.")
+            st.stop()
+
+        df["rr_previous"] = pd.to_numeric(df["rr_previous"], errors="coerce")
+        bad = int(df["rr_previous"].isna().sum())
+
+        if bad:
+            st.warning(f"{bad} row(s) had non-numeric values and were removed.")
+            df = df.dropna(subset=["rr_previous"]).reset_index(drop=True)
+
+        if df.empty:
+            st.error("No valid rows to analyse.")
+            st.stop()
+
+        preds, probs, labels = predict_rr(model, df["rr_previous"].values)
+        out = df.copy()
+        out["prediction"] = preds
+
+        for i, label in enumerate(labels):
+            out[f"prob_{label}"] = probs[:, i].round(4)
+
+        counts = out["prediction"].value_counts().to_dict()
+        total = len(out)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(kpi("Total beats", f"{total:,}"), unsafe_allow_html=True)
+
+        for col, label in zip((c2, c3, c4), ("N", "S", "V")):
+            n = counts.get(label, 0)
+            col.markdown(
+                kpi(f"{label} predictions", f"{n} · {n / total * 100:.0f}%"),
+                unsafe_allow_html=True
+            )
+
+        left, right = st.columns(2)
+
+        with left:
+            st.plotly_chart(
+                distribution_chart(counts, "Prediction distribution"),
+                width="stretch"
+            )
+
+        with right:
+            fig = go.Figure()
+
+            for label in ("N", "S", "V"):
+                sub = out[out["prediction"] == label]["rr_previous"]
+                if len(sub):
+                    fig.add_trace(
+                        go.Histogram(
+                            x=sub,
+                            name=label,
+                            marker_color=CLASS_COLORS[label],
+                            opacity=0.85
+                        )
+                    )
+
+            fig.update_layout(
+                title="RR intervals by predicted class",
+                barmode="overlay"
+            )
+            fig.update_xaxes(title="RR (s)")
+            st.plotly_chart(style_fig(fig), width="stretch")
+
+        st.markdown("### Prediction records")
+        st.dataframe(out, width="stretch")
+
+        st.download_button(
+            "Download prediction report (CSV)",
+            out.to_csv(index=False).encode("utf-8"),
+            file_name="cardiosense_predictions.csv",
+            mime="text/csv"
+        )
+
+    st.markdown(DISCLAIMER, unsafe_allow_html=True)
+
+# ------------------------------------------------------------------
+# PAGE: ABOUT
+# ------------------------------------------------------------------
+else:
+    st.markdown("## About the Model")
+    t1, t2, t3, t4, t5 = st.tabs(
+        ["Model", "Data", "Evaluation", "Limitations", "Roadmap"]
+    )
+
+    with t1:
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(kpi("Algorithm", "Random Forest", small=True), unsafe_allow_html=True)
+        c2.markdown(kpi("Trees", "300"), unsafe_allow_html=True)
+        c3.markdown(kpi("Input", "Previous RR", small=True), unsafe_allow_html=True)
+        st.markdown(
+            "- Class weighting: `balanced_subsample`\n"
+            "- Minimum samples per leaf: 2\n"
+            "- Random state: 42\n"
+            "- Trained on the full available deployment dataset."
+        )
+
+    with t2:
+        st.markdown(
+            "**MIT-BIH Arrhythmia Database** · 360 Hz · lead MLII · 0.5–40 Hz Butterworth filter."
+        )
+        st.plotly_chart(
+            distribution_chart(TRAIN_COUNTS, "Deployment training set (log scale)", log=True),
+            width="stretch"
+        )
+
+    with t3:
+        st.markdown('<span class="chip">EXPLORATORY</span>', unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.markdown(kpi("Balanced acc.", "74.05%", small=True), unsafe_allow_html=True)
+        m2.markdown(kpi("Macro F1", "55.99%", small=True), unsafe_allow_html=True)
+        m3.markdown(kpi("S recall", "54.48%", small=True), unsafe_allow_html=True)
+        m4.markdown(kpi("S precision", "~6.20%", small=True), unsafe_allow_html=True)
+
+        st.markdown(
+            '<div class="disclaimer">Exploratory evaluation on 6 records (108, 116, 118, 121, 200, 203) '
+            "from an earlier experiment. These records influenced model exploration, so this is "
+            "<b>not</b> independent final validation.</div>",
+            unsafe_allow_html=True,
+        )
+
+    with t4:
+        st.markdown(
+            "1. Uses a single feature: previous RR interval.\n"
+            "2. Does not classify raw ECG waveforms and has no live ECG acquisition.\n"
+            "3. Low S-class precision in exploratory evaluation.\n"
+            "4. Highly imbalanced training data.\n"
+            "5. No independent patient-level validation yet.\n"
+            "6. Educational prototype, not a medical device."
+        )
+
+    with t5:
+        st.markdown(
+            '<span class="chip purple">PLANNED</span> &nbsp; Not implemented yet.',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "- ECG waveform-based classification\n"
+            "- Better S-class detection\n"
+            "- Morphology + rhythm-context features\n"
+            "- Independent patient-level validation\n"
+            "- Real-time ECG monitoring\n"
+            "- Richer reports and interpretability"
+        )
+
+    st.markdown(DISCLAIMER, unsafe_allow_html=True)

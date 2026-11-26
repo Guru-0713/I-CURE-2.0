@@ -1,0 +1,1225 @@
+/*
+  I-CURE 2.0 - LIVE SENSOR MONITORING + WIFI ALERT SENDING
+  Board: ESP32 Dev Module
+
+  MPU6050  : 0x68 / 0x69
+  MAX30102 : 0x57
+  BMP280   : 0x76 / 0x77
+  SH110X OLED: 0x3C
+
+  Buzzer: GPIO25
+  STOP button: GPIO27
+  DEMO toggle button: GPIO26
+
+  Research prototype only. Not a medical device.
+*/
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_GFX.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <math.h>
+
+// ---------- PINS ----------
+#define SDA_PIN     21
+#define SCL_PIN     22
+#define BUZZER_PIN  25
+#define ACK_BUTTON  27
+#define DEMO_BUTTON 26
+
+// Change to true if your buzzer module is active-LOW
+const bool BUZZER_ACTIVE_LOW = false;
+
+// ---------- WIFI + FASTAPI ----------
+const char* WIFI_SSID = "Arfaz";
+const char* WIFI_PASSWORD = "11111111";
+
+const char* SERVER_URL =
+  "http://10.250.136.224:8000/api/readings";
+
+unsigned long lastServerSend = 0;
+unsigned long lastWiFiAttempt = 0;
+
+const unsigned long SERVER_SEND_INTERVAL = 2000;
+
+// ---------- OLED ----------
+#define SCREEN_W 128
+#define SCREEN_H 64
+
+Adafruit_SH1106G display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+// ---------- SENSORS ----------
+Adafruit_BMP280 bmp;
+MAX30105 particleSensor;
+
+uint8_t mpuAddr = 0x68;
+
+bool mpuOk = false;
+bool bmpOk = false;
+bool maxOk = false;
+bool oledOk = false;
+
+// =====================================================
+// DETECTION PARAMETERS - ORIGINAL VALUES
+// =====================================================
+
+const float FS = 50.0f;
+const int N = 128;
+
+const unsigned long SAMPLE_INTERVAL_US = 20000UL;
+
+const int K_LOW_MIN = 1;
+const int K_LOW_MAX = 7;
+
+const int K_SZ_MIN = 8;
+const int K_SZ_MAX = 30;
+
+const float RMS_G_THRESHOLD = 0.30f;
+const float BAND_RATIO_MIN = 0.60f;
+
+const float DOM_FREQ_MIN = 3.0f;
+const float DOM_FREQ_MAX = 12.0f;
+
+const int WINDOWS_ALERT = 3;
+const int WINDOWS_ALERT_HR = 2;
+
+const float HR_MIN_BPM = 40.0f;
+const float HR_MAX_BPM = 180.0f;
+
+const float HR_JUMP_MAX = 0.20f;
+const float HR_SURGE_BPM = 30.0f;
+
+const long FINGER_IR_MIN = 50000;
+
+const unsigned long ALERT_CLEAR_MS = 10000;
+
+// ---------- LIVE SENSOR DATA ----------
+
+float axg = 0;
+float ayg = 0;
+float azg = 1;
+
+float accG = 1.0f;
+
+long lastIR = 0;
+
+float tempC = 0;
+float pressure_hPa = 0;
+
+// ---------- MOTION STATE ----------
+
+float accBuf[N];
+float dynBuf[N];
+
+int accIdx = 0;
+
+unsigned long lastSampleUs = 0;
+
+float lastRmsG = 0;
+float lastRatio = 0;
+float lastDomFreq = 0;
+
+int shakeWindows = 0;
+int mpuFail = 0;
+
+// ---------- HEART RATE STATE ----------
+
+const byte RATE_SIZE = 4;
+
+float rates[RATE_SIZE];
+
+byte rateSpot = 0;
+byte rateCount = 0;
+
+long lastBeat = 0;
+
+int beatAvg = 0;
+int rejectCount = 0;
+
+float hrBaseline = 0;
+
+bool fingerOn = false;
+
+// ---------- ALERT STATE ----------
+
+bool alertActive = false;
+bool alarmAcknowledged = false;
+
+unsigned long lastShakeMs = 0;
+unsigned long lastDisplayMs = 0;
+unsigned long lastEnvMs = 0;
+unsigned long lastLogMs = 0;
+unsigned long lastReinitMs = 0;
+
+// ---------- BUTTON STATE ----------
+
+bool demoMode = false;
+
+bool previousDemoButtonState = HIGH;
+bool previousAckButtonState = HIGH;
+
+unsigned long lastDemoDebounce = 0;
+unsigned long lastAckDebounce = 0;
+
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+
+// ---------- BUZZER STATE ----------
+
+bool buzzerIsOn = false;
+
+// =====================================================
+// BUZZER CONTROL
+// =====================================================
+
+void setBuzzer(bool turnOn) {
+
+  buzzerIsOn = turnOn;
+
+  if (BUZZER_ACTIVE_LOW) {
+    digitalWrite(BUZZER_PIN, turnOn ? LOW : HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, turnOn ? HIGH : LOW);
+  }
+}
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi() {
+
+  Serial.println();
+  Serial.println("Connecting to Wi-Fi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startTime = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startTime < 15000
+  ) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println();
+    Serial.println("WIFI CONNECTED!");
+
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
+  } else {
+
+    Serial.println();
+    Serial.println("Wi-Fi connection failed.");
+    Serial.println("Will retry automatically.");
+  }
+}
+
+// =====================================================
+// SEND LIVE READINGS TO FASTAPI
+// =====================================================
+
+void sendReadingToServer() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    if (millis() - lastWiFiAttempt >= 10000) {
+
+      lastWiFiAttempt = millis();
+
+      Serial.println("Reconnecting Wi-Fi...");
+
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+
+    return;
+  }
+
+  if (millis() - lastServerSend < SERVER_SEND_INTERVAL) {
+    return;
+  }
+
+  lastServerSend = millis();
+
+  HTTPClient http;
+  WiFiClient client;
+
+  http.setTimeout(2000);
+
+  if (!http.begin(client, SERVER_URL)) {
+
+    Serial.println("HTTP connection initialization failed.");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  bool positiveAlert = alertActive || demoMode;
+
+  String motionStatus =
+    positiveAlert ? "Abnormal movement" : "Normal";
+
+  String detectionStatus =
+    positiveAlert
+      ? "Possible seizure-like activity detected"
+      : "No seizure-like activity";
+
+  String json = "{";
+
+  json += "\"heart_rate\":";
+  json += String(beatAvg);
+
+  json += ",\"spo2\":0";
+
+  json += ",\"pressure\":";
+  json += String(pressure_hPa, 2);
+
+  json += ",\"acceleration_x\":";
+  json += String(axg, 3);
+
+  json += ",\"acceleration_y\":";
+  json += String(ayg, 3);
+
+  json += ",\"acceleration_z\":";
+  json += String(azg, 3);
+
+  json += ",\"motion_status\":\"";
+  json += motionStatus;
+
+  json += "\",\"detection_status\":\"";
+  json += detectionStatus;
+
+  json += "\"}";
+
+  Serial.println();
+  Serial.println("Sending data to I-CURE backend:");
+  Serial.println(json);
+
+  int httpCode = http.POST(json);
+
+  if (httpCode > 0) {
+
+    Serial.print("Backend HTTP response: ");
+    Serial.println(httpCode);
+
+    String response = http.getString();
+
+    Serial.println("Backend response:");
+    Serial.println(response);
+
+  } else {
+
+    Serial.print("HTTP sending failed: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
+
+// =====================================================
+// MPU6050 - DIRECT REGISTER ACCESS
+// =====================================================
+
+bool mpuWrite(uint8_t reg, uint8_t val) {
+
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(reg);
+  Wire.write(val);
+
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuInit() {
+
+  uint8_t addrs[2] = {0x68, 0x69};
+
+  for (int i = 0; i < 2; i++) {
+
+    mpuAddr = addrs[i];
+
+    Wire.beginTransmission(mpuAddr);
+
+    if (Wire.endTransmission() != 0) {
+      continue;
+    }
+
+    mpuWrite(0x6B, 0x00);
+    delay(50);
+
+    mpuWrite(0x19, 0x00);
+    mpuWrite(0x1A, 0x03);
+    mpuWrite(0x1B, 0x00);
+    mpuWrite(0x1C, 0x10);
+
+    delay(10);
+
+    Wire.beginTransmission(mpuAddr);
+    Wire.write(0x75);
+    Wire.endTransmission(false);
+
+    Wire.requestFrom((int)mpuAddr, 1);
+
+    if (Wire.available()) {
+
+      Serial.printf(
+        "MPU at 0x%02X, WHO_AM_I=0x%02X\n",
+        mpuAddr, Wire.read()
+      );
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+bool mpuReadAccel(float &x, float &y, float &z) {
+
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom((int)mpuAddr, 6) != 6) {
+    return false;
+  }
+
+  int16_t rx = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t ry = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t rz = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  const float LSB_PER_G = 4096.0f;
+
+  x = rx / LSB_PER_G;
+  y = ry / LSB_PER_G;
+  z = rz / LSB_PER_G;
+
+  return true;
+}
+
+// =====================================================
+// BMP280 INITIALIZATION
+// =====================================================
+
+bool bmpInit() {
+
+  uint8_t addrs[2] = {0x76, 0x77};
+
+  uint8_t ids[4] = {
+    0x58, 0x60, 0x56, 0x57
+  };
+
+  for (int a = 0; a < 2; a++) {
+
+    for (int i = 0; i < 4; i++) {
+
+      if (bmp.begin(addrs[a], ids[i])) {
+
+        bmp.setSampling(
+          Adafruit_BMP280::MODE_NORMAL,
+          Adafruit_BMP280::SAMPLING_X2,
+          Adafruit_BMP280::SAMPLING_X16,
+          Adafruit_BMP280::FILTER_X16,
+          Adafruit_BMP280::STANDBY_MS_500
+        );
+
+        Serial.printf(
+          "BMP at 0x%02X, chip ID 0x%02X\n",
+          addrs[a], ids[i]
+        );
+
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// =====================================================
+// I2C SCAN
+// =====================================================
+
+void i2cScan() {
+
+  Serial.println("I2C scan:");
+
+  int found = 0;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+
+    Wire.beginTransmission(addr);
+
+    if (Wire.endTransmission() == 0) {
+
+      Serial.printf("Found device: 0x%02X\n", addr);
+      found++;
+    }
+  }
+
+  if (!found) {
+    Serial.println("No I2C devices found. Check wiring.");
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(300);
+
+  // Set buzzer OFF immediately
+  pinMode(BUZZER_PIN, OUTPUT);
+  setBuzzer(false);
+
+  pinMode(ACK_BUTTON, INPUT_PULLUP);
+  pinMode(DEMO_BUTTON, INPUT_PULLUP);
+
+  previousDemoButtonState = digitalRead(DEMO_BUTTON);
+  previousAckButtonState = digitalRead(ACK_BUTTON);
+
+  connectWiFi();
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  i2cScan();
+
+  oledOk = display.begin(0x3C, true);
+
+  if (oledOk) {
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 0);
+
+    display.println("I-CURE 2.0");
+    display.println("Checking sensors...");
+
+    display.display();
+  }
+
+  mpuOk = mpuInit();
+
+  bmpOk = bmpInit();
+
+  maxOk = particleSensor.begin(Wire, I2C_SPEED_FAST);
+
+  if (maxOk) {
+
+    particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
+
+    particleSensor.setPulseAmplitudeRed(0x1F);
+    particleSensor.setPulseAmplitudeIR(0x1F);
+    particleSensor.setPulseAmplitudeGreen(0);
+  }
+
+  Serial.println();
+  Serial.println("===== I-CURE 2.0 SENSOR STATUS =====");
+
+  Serial.printf("MPU6050 : %s\n", mpuOk ? "OK" : "FAIL");
+  Serial.printf("MAX30102: %s\n", maxOk ? "OK" : "FAIL");
+  Serial.printf("BMP280  : %s\n", bmpOk ? "OK" : "FAIL");
+  Serial.printf("OLED    : %s\n", oledOk ? "OK" : "FAIL");
+
+  if (oledOk) {
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+
+    display.println("I-CURE 2.0");
+    display.println("---------------------");
+
+    display.print("MPU6050: ");
+    display.println(mpuOk ? "OK" : "FAIL");
+
+    display.print("MAX30102: ");
+    display.println(maxOk ? "OK" : "FAIL");
+
+    display.print("BMP280: ");
+    display.println(bmpOk ? "OK" : "FAIL");
+
+    display.display();
+  }
+
+  delay(2000);
+
+  lastSampleUs = micros();
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  handleDemoButton();
+
+  readHeartRate();
+
+  sampleMotion();
+
+  readEnvironment();
+
+  handleAlertState();
+
+  sendReadingToServer();
+
+  updateDisplay();
+
+  logSerial();
+}
+
+// =====================================================
+// MAX30102 - HEART RATE + RAW IR
+// =====================================================
+
+void readHeartRate() {
+
+  if (!maxOk) return;
+
+  particleSensor.check();
+
+  while (particleSensor.available()) {
+
+    long ir = particleSensor.getFIFOIR();
+
+    particleSensor.nextSample();
+
+    lastIR = ir;
+
+    if (ir <= FINGER_IR_MIN) {
+
+      if (fingerOn) {
+        resetHeartRate();
+      }
+
+      fingerOn = false;
+      continue;
+    }
+
+    fingerOn = true;
+
+    if (checkForBeat(ir)) {
+      onBeat(millis());
+    }
+  }
+}
+
+void resetHeartRate() {
+
+  beatAvg = 0;
+  rateSpot = 0;
+  rateCount = 0;
+  rejectCount = 0;
+  lastBeat = 0;
+}
+
+void onBeat(long nowMs) {
+
+  long delta = nowMs - lastBeat;
+
+  lastBeat = nowMs;
+
+  if (delta <= 0 || delta > 2000) return;
+
+  float bpm = 60000.0f / delta;
+
+  if (bpm < HR_MIN_BPM || bpm > HR_MAX_BPM) return;
+
+  if (
+    beatAvg > 0 &&
+    fabsf(bpm - beatAvg) / beatAvg > HR_JUMP_MAX
+  ) {
+
+    if (++rejectCount >= 5) {
+      resetHeartRate();
+    }
+
+    return;
+  }
+
+  rejectCount = 0;
+
+  rates[rateSpot++] = bpm;
+  rateSpot %= RATE_SIZE;
+
+  if (rateCount < RATE_SIZE) {
+    rateCount++;
+  }
+
+  float sum = 0;
+
+  for (byte i = 0; i < rateCount; i++) {
+    sum += rates[i];
+  }
+
+  beatAvg = (int)(sum / rateCount + 0.5f);
+
+  if (
+    !alertActive &&
+    shakeWindows == 0 &&
+    rateCount == RATE_SIZE
+  ) {
+
+    hrBaseline = (hrBaseline == 0)
+      ? beatAvg
+      : (0.98f * hrBaseline + 0.02f * beatAvg);
+  }
+}
+
+// =====================================================
+// MPU6050 - MOVEMENT MONITORING
+// =====================================================
+
+void sampleMotion() {
+
+  if (!mpuOk) {
+
+    if (millis() - lastReinitMs > 2000) {
+
+      lastReinitMs = millis();
+
+      mpuOk = mpuInit();
+      mpuFail = 0;
+    }
+
+    return;
+  }
+
+  unsigned long now = micros();
+
+  if (now - lastSampleUs < SAMPLE_INTERVAL_US) {
+    return;
+  }
+
+  lastSampleUs += SAMPLE_INTERVAL_US;
+
+  if (now - lastSampleUs > 200000UL) {
+    lastSampleUs = now;
+  }
+
+  float x, y, z;
+
+  if (!mpuReadAccel(x, y, z)) {
+
+    if (++mpuFail > 25) {
+      mpuOk = false;
+    }
+
+    return;
+  }
+
+  mpuFail = 0;
+
+  axg = x;
+  ayg = y;
+  azg = z;
+
+  float mag = sqrtf(x * x + y * y + z * z);
+
+  accG = 0.9f * accG + 0.1f * mag;
+
+  accBuf[accIdx++] = mag;
+
+  if (accIdx >= N) {
+
+    accIdx = 0;
+
+    analyzeWindow();
+  }
+}
+
+float goertzelPower(int k) {
+
+  float coeff = 2.0f * cosf(2.0f * PI * k / N);
+
+  float s1 = 0;
+  float s2 = 0;
+
+  for (int i = 0; i < N; i++) {
+
+    float s = dynBuf[i] + coeff * s1 - s2;
+
+    s2 = s1;
+    s1 = s;
+  }
+
+  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+void analyzeWindow() {
+
+  float mean = 0;
+
+  for (int i = 0; i < N; i++) {
+    mean += accBuf[i];
+  }
+
+  mean /= N;
+
+  float sumSq = 0;
+
+  for (int i = 0; i < N; i++) {
+
+    dynBuf[i] = accBuf[i] - mean;
+
+    sumSq += dynBuf[i] * dynBuf[i];
+  }
+
+  lastRmsG = sqrtf(sumSq / N);
+
+  float pLow = 0;
+  float pSz = 0;
+  float peakP = 0;
+
+  int peakK = 0;
+
+  for (int k = K_LOW_MIN; k <= K_SZ_MAX; k++) {
+
+    float p = goertzelPower(k);
+
+    if (p < 0) p = 0;
+
+    if (k <= K_LOW_MAX) {
+      pLow += p;
+    } else {
+      pSz += p;
+    }
+
+    if (p > peakP) {
+
+      peakP = p;
+      peakK = k;
+    }
+  }
+
+  lastRatio = pSz / (pLow + pSz + 1e-9f);
+
+  lastDomFreq = peakK * FS / N;
+
+  bool shaking =
+    (lastRmsG >= RMS_G_THRESHOLD) &&
+    (lastRatio >= BAND_RATIO_MIN) &&
+    (lastDomFreq >= DOM_FREQ_MIN) &&
+    (lastDomFreq <= DOM_FREQ_MAX);
+
+  if (shaking) {
+
+    shakeWindows++;
+
+    lastShakeMs = millis();
+
+  } else {
+
+    shakeWindows = 0;
+  }
+
+  bool hrSurge =
+    fingerOn &&
+    hrBaseline > 0 &&
+    beatAvg > 0 &&
+    (beatAvg - hrBaseline) >= HR_SURGE_BPM;
+
+  if (
+    !alertActive &&
+    (
+      shakeWindows >= WINDOWS_ALERT ||
+      (shakeWindows >= WINDOWS_ALERT_HR && hrSurge)
+    )
+  ) {
+
+    alertActive = true;
+    alarmAcknowledged = false;
+
+    lastShakeMs = millis();
+
+    Serial.println();
+    Serial.println("!!! POSSIBLE SEIZURE-LIKE ACTIVITY !!!");
+  }
+}
+
+// =====================================================
+// BMP280 - TEMPERATURE + PRESSURE
+// =====================================================
+
+void readEnvironment() {
+
+  if (!bmpOk) return;
+
+  if (millis() - lastEnvMs < 1000) return;
+
+  lastEnvMs = millis();
+
+  float t = bmp.readTemperature();
+  float p = bmp.readPressure();
+
+  if (!isnan(t) && !isnan(p) && p > 30000.0f) {
+
+    tempC = t;
+
+    pressure_hPa = p / 100.0f;
+  }
+}
+
+// =====================================================
+// DEMO BUTTON - PRESS TO START / PRESS AGAIN TO STOP
+// =====================================================
+
+void handleDemoButton() {
+
+  bool currentState = digitalRead(DEMO_BUTTON);
+
+  if (
+    currentState == LOW &&
+    previousDemoButtonState == HIGH &&
+    millis() - lastDemoDebounce > BUTTON_DEBOUNCE_MS
+  ) {
+
+    lastDemoDebounce = millis();
+
+    if (!demoMode) {
+
+      demoMode = true;
+      alertActive = true;
+      alarmAcknowledged = false;
+
+      lastShakeMs = millis();
+
+      Serial.println();
+      Serial.println("================================");
+      Serial.println("DEMO ALERT ACTIVATED!");
+      Serial.println("PRESS DEMO BUTTON AGAIN OR STOP BUTTON");
+      Serial.println("================================");
+
+    } else {
+
+      demoMode = false;
+      alertActive = false;
+      alarmAcknowledged = false;
+
+      shakeWindows = 0;
+
+      setBuzzer(false);
+
+      Serial.println("DEMO ALERT STOPPED");
+    }
+  }
+
+  previousDemoButtonState = currentState;
+}
+
+// =====================================================
+// BUZZER + STOP BUTTON
+// =====================================================
+
+void handleAlertState() {
+
+  // Read STOP button with debounce
+  bool ackState = digitalRead(ACK_BUTTON);
+
+  if (
+    ackState == LOW &&
+    previousAckButtonState == HIGH &&
+    millis() - lastAckDebounce > BUTTON_DEBOUNCE_MS
+  ) {
+
+    lastAckDebounce = millis();
+
+    // Stop demo completely
+    if (demoMode) {
+
+      demoMode = false;
+      alertActive = false;
+      alarmAcknowledged = false;
+
+      shakeWindows = 0;
+
+      setBuzzer(false);
+
+      Serial.println("DEMO STOPPED BY STOP BUTTON");
+
+    }
+    // Silence real sensor alarm, but keep detection active
+    else if (alertActive && !alarmAcknowledged) {
+
+      alarmAcknowledged = true;
+
+      setBuzzer(false);
+
+      Serial.println("ALERT ACKNOWLEDGED - BUZZER SILENCED");
+    }
+  }
+
+  previousAckButtonState = ackState;
+
+  // Demo alarm
+  if (demoMode) {
+
+    if (!buzzerIsOn) {
+      setBuzzer(true);
+    }
+
+    // Make the buzzer pulse
+    static unsigned long lastDemoBuzz = 0;
+    static bool demoBuzzState = false;
+
+    if (millis() - lastDemoBuzz >= 200) {
+
+      lastDemoBuzz = millis();
+      demoBuzzState = !demoBuzzState;
+
+      setBuzzer(demoBuzzState);
+    }
+
+    return;
+  }
+
+  // No active alert
+  if (!alertActive) {
+
+    setBuzzer(false);
+
+    alarmAcknowledged = false;
+
+    return;
+  }
+
+  // Real sensor alert: sound only if not acknowledged
+  if (!alarmAcknowledged) {
+
+    static unsigned long lastBuzzToggle = 0;
+    static bool buzzState = false;
+
+    if (millis() - lastBuzzToggle >= 200) {
+
+      lastBuzzToggle = millis();
+      buzzState = !buzzState;
+
+      setBuzzer(buzzState);
+    }
+
+  } else {
+
+    setBuzzer(false);
+  }
+
+  // Clear alert after movement settles
+  bool calm = (millis() - lastShakeMs > ALERT_CLEAR_MS);
+
+  if (calm) {
+
+    alertActive = false;
+    alarmAcknowledged = false;
+
+    shakeWindows = 0;
+
+    setBuzzer(false);
+
+    Serial.println("Detection cleared - alarm re-armed");
+  }
+}
+
+// =====================================================
+// OLED - ALL LIVE SENSOR READINGS
+// =====================================================
+
+void updateDisplay() {
+
+  if (!oledOk) return;
+
+  if (millis() - lastDisplayMs < 500) return;
+
+  lastDisplayMs = millis();
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("I-CURE 2.0 LIVE");
+
+  display.setCursor(0, 8);
+
+  if (mpuOk) {
+
+    display.print("X:");
+    display.print(axg, 1);
+
+    display.print(" Y:");
+    display.print(ayg, 1);
+
+  } else {
+
+    display.print("MPU6050 ERROR");
+  }
+
+  display.setCursor(0, 16);
+
+  if (mpuOk) {
+
+    display.print("Z:");
+    display.print(azg, 1);
+
+    display.print(" Mag:");
+    display.print(accG, 1);
+
+    display.print("g");
+  }
+
+  display.setCursor(0, 24);
+
+  if (!maxOk) {
+
+    display.print("MAX30102 ERROR");
+
+  } else {
+
+    display.print("IR:");
+    display.print(lastIR);
+  }
+
+  display.setCursor(0, 32);
+
+  if (!maxOk) {
+
+    display.print("HR: SENSOR ERROR");
+
+  } else if (!fingerOn) {
+
+    display.print("HR: NO FINGER");
+
+  } else if (beatAvg == 0) {
+
+    display.print("HR: MEASURING");
+
+  } else {
+
+    display.print("HR:");
+    display.print(beatAvg);
+    display.print(" BPM");
+  }
+
+  display.setCursor(0, 40);
+
+  if (bmpOk) {
+
+    display.print("Temp:");
+    display.print(tempC, 1);
+    display.print(" C");
+
+  } else {
+
+    display.print("Temp: ERROR");
+  }
+
+  display.setCursor(0, 48);
+
+  if (bmpOk) {
+
+    display.print("Pressure:");
+    display.print(pressure_hPa, 1);
+    display.print("hPa");
+
+  } else {
+
+    display.print("Pressure: ERROR");
+  }
+
+  display.setCursor(0, 56);
+
+  if (demoMode) {
+
+    display.print("DEMO ALERT!");
+
+  } else if (alertActive && alarmAcknowledged) {
+
+    display.print("ALERT SILENCED");
+
+  } else if (alertActive) {
+
+    display.print("POSSIBLE SEIZURE!");
+
+  } else {
+
+    display.print("Status: NO ALERT");
+  }
+
+  display.display();
+}
+
+// =====================================================
+// SERIAL MONITOR - LIVE SENSOR VALUES
+// =====================================================
+
+void logSerial() {
+
+  if (millis() - lastLogMs < 500) return;
+
+  lastLogMs = millis();
+
+  Serial.print("AX=");
+  Serial.print(axg, 2);
+
+  Serial.print(" AY=");
+  Serial.print(ayg, 2);
+
+  Serial.print(" AZ=");
+  Serial.print(azg, 2);
+
+  Serial.print(" | MAG=");
+  Serial.print(accG, 2);
+
+  Serial.print("g | IR=");
+  Serial.print(lastIR);
+
+  Serial.print(" | HR=");
+  Serial.print(beatAvg);
+
+  Serial.print(" | TEMP=");
+  Serial.print(tempC, 1);
+
+  Serial.print("C | PRESSURE=");
+  Serial.print(pressure_hPa, 1);
+
+  Serial.print("hPa | RMS=");
+  Serial.print(lastRmsG, 3);
+
+  Serial.print(" | RATIO=");
+  Serial.print(lastRatio, 2);
+
+  Serial.print(" | FREQ=");
+  Serial.print(lastDomFreq, 1);
+
+  Serial.print("Hz | WINDOWS=");
+  Serial.print(shakeWindows);
+
+  Serial.print(" | STATUS=");
+
+  if (demoMode) {
+    Serial.println("DEMO ALERT");
+  } else if (alertActive && alarmAcknowledged) {
+    Serial.println("ALERT SILENCED");
+  } else if (alertActive) {
+    Serial.println("POSSIBLE SEIZURE-LIKE ACTIVITY");
+  } else {
+    Serial.println("NO ALERT");
+  }
+}

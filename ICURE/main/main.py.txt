@@ -1,0 +1,117 @@
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from datetime import datetime
+import sqlite3
+
+app = FastAPI(title="I-CURE 2.0 API")
+
+DB_NAME = "icure.db"
+
+
+def initialize_database():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            heart_rate REAL,
+            spo2 REAL,
+            pressure REAL,
+            motion_status TEXT,
+            detection_status TEXT,
+            timestamp TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+initialize_database()
+
+
+class SensorData(BaseModel):
+    heart_rate: float
+    spo2: float
+    pressure: float
+    motion_status: str
+    detection_status: str
+
+
+@app.get("/")
+def home():
+    return {
+        "project": "I-CURE 2.0",
+        "status": "Backend running"
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+@app.post("/api/readings")
+def receive_readings(data: SensorData):
+    timestamp = datetime.now().isoformat()
+
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("""
+        INSERT INTO readings
+        (heart_rate, spo2, pressure,
+         motion_status, detection_status, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        data.heart_rate,
+        data.spo2,
+        data.pressure,
+        data.motion_status,
+        data.detection_status,
+        timestamp
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "message": "Sensor data received",
+        "timestamp": timestamp
+    }
+
+
+@app.get("/api/latest")
+def latest_reading():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+
+    row = conn.execute("""
+        SELECT * FROM readings
+        ORDER BY id DESC LIMIT 1
+    """).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return {"message": "No readings available"}
+
+    return dict(row)
+
+
+@app.get("/api/history")
+def reading_history():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT * FROM readings
+        ORDER BY id DESC LIMIT 100
+    """).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+
+@app.get("/dashboard")
+def dashboard():
+    return FileResponse("dashboard.html")
